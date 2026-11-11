@@ -1,0 +1,164 @@
+--- a/ui/richtext/view.go
++++ b/ui/richtext/view.go
+@@ -16,6 +16,16 @@
+ 
+ // EditorOptions configure an Editor.
+ type EditorOptions struct {
++	// OnPaste may handle a paste, including Paste and Match Style. Returning
++	// true skips the default insertion. It may edit the Document as one undo
++	// step; a rejected paste must leave it unchanged.
++	OnPaste func(matchStyle bool) bool
++	// OnCopy writes a selected Text instead of the default representations.
++	// False reports failure: Cut must not delete the selection.
++	OnCopy func(Text) bool
++	// ScrollY retains the scroll offset outside the view, including while
++	// switching documents. The view clamps it to the laid-out viewport.
++	ScrollY *float64
+ 	// Label names the editor to assistive technology; "Rich text" when
+ 	// empty.
+ 	Label string
+@@ -201,6 +211,7 @@
+ 	t := c.Theme()
+ 	e := ui.Box(c).Focusable().Clip()
+ 	v := ui.Local(e, "richtext", func() view { return view{cursor: ui.CursorText} })
++	fresh := v.doc != doc
+ 	if v.doc != doc {
+ 		*v = view{doc: doc, reveal: true}
+ 		doc.lock()
+@@ -216,6 +227,10 @@
+ 	v.services = c.Services()
+ 	v.setLook(t, styled)
+ 	v.sync()
++	if y := v.opts.ScrollY; y != nil && (fresh || *y != v.scroll) {
++		v.setScroll(max(0, *y))
++		v.reveal = false
++	}
+ 	v.inView = e.Hovered()
+ 	focused := e.Focused()
+ 	if focused != v.focused {
+@@ -748,6 +763,9 @@
+ // there.
+ func (v *view) setScroll(y float64) {
+ 	v.scroll = y
++	if v.opts.ScrollY != nil {
++		*v.opts.ScrollY = y
++	}
+ 	v.anchor = v.hs.at(y)
+ 	v.anchorOff = y - v.hs.top(v.anchor)
+ }
+--- a/ui/richtext/clipboard.go
++++ b/ui/richtext/clipboard.go
+@@ -194,18 +194,30 @@
+ }
+ 
+ // copySelection puts the selection on the clipboard.
+-func (v *view) copySelection() {
++func (v *view) copySelection() bool {
+ 	a, z := v.selection()
+ 	if a == z {
+-		return
++		return false
++	}
++	if v.opts.OnCopy != nil {
++		return v.opts.OnCopy(v.shown.Slice(a, z))
+ 	}
+ 	v.services.WriteClipboardData(clipboardData(v.shown.Slice(a, z)))
++	return true
+ }
+ 
+ // paste replaces the selection with what the clipboard holds: the richest
+ // format the editor reads, or its plain text in the typing attributes when
+ // matching the style.
+ func (v *view) paste(matchStyle bool) {
++	if v.opts.OnPaste != nil {
++		v.publish()
++		if v.opts.OnPaste(matchStyle) {
++			v.sync()
++			v.mode, v.coalesce, v.reveal = newStep, false, true
++			return
++		}
++	}
+ 	var t Text
+ 	ok := false
+ 	if !matchStyle {
+--- a/ui/richtext/input.go
++++ b/ui/richtext/input.go
+@@ -488,8 +488,9 @@
+ 		return true
+ 	case "cut":
+ 		if a != z && !v.opts.ReadOnly {
+-			v.copySelection()
+-			v.deleteRange(a, z, false)
++			if v.copySelection() {
++				v.deleteRange(a, z, false)
++			}
+ 		}
+ 		return true
+ 	case "paste", "pasteAndMatchStyle":
+--- /dev/null
++++ b/ui/richtext/transfer_policy_test.go
+@@ -0,0 +1,44 @@
++package richtext
++
++import (
++	"github.com/egoist/mygo/ui"
++	"testing"
++)
++
++func TestPasteDelegateAndFailedCut(t *testing.T) {
++	d := NewDocument(NewText("before"))
++	reject := true
++	tt := ui.NewTester(func(c *ui.Context) {
++		EditorBase(c, d, EditorOptions{
++			OnCopy: func(Text) bool { return false },
++			OnPaste: func(bool) bool {
++				if !reject {
++					d.Edit(func(e *Edit) { a, z := e.Selection(); e.Replace(a, z, NewText("图😀")); e.Select(2, 2) })
++				}
++				return true
++			},
++		}).Fill().Focus()
++	}, 500, 300)
++	d.SetSelection(0, 6)
++	tt.Frame()
++	tt.Command("cut")
++	if d.Text().String() != "before" || d.CanUndo() {
++		t.Fatal("failed cut changed text/history")
++	}
++	tt.Command("paste")
++	a, c := d.Selection()
++	if d.Text().String() != "before" || a != 0 || c != 6 || d.CanUndo() {
++		t.Fatal("rejected paste changed selection/history")
++	}
++	reject = false
++	tt.Command("paste")
++	tt.Type("!")
++	if d.Text().String() != "图😀!" {
++		t.Fatal("delegate did not synchronize selection", d.Text().String())
++	}
++	d.Undo()
++	d.Undo()
++	if d.Text().String() != "before" {
++		t.Fatal("delegate paste broke undo")
++	}
++}
+--- a/internal/darwin/surface_drag.go
++++ b/internal/darwin/surface_drag.go
+@@ -100,6 +100,8 @@
+ 		return utHTML
+ 	case transfer.PNG:
+ 		return utPNG
++	case "application/rtfd":
++		return "com.apple.flat-rtfd"
+ 	case transfer.FileList:
+ 		return "public.file-url"
+ 	case transfer.URIList:
+@@ -131,6 +133,8 @@
+ 		return transfer.HTML
+ 	case utPNG:
+ 		return transfer.PNG
++	case "com.apple.flat-rtfd":
++		return "application/rtfd"
+ 	case "public.file-url":
+ 		return transfer.FileList
+ 	case "public.url", "dev.mygo.uri-list":

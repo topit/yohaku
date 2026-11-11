@@ -1,0 +1,11 @@
+{
+  "apiVersion": 1,
+  "id": "tidy-text",
+  "name": "Tidy text",
+  "version": "1.0.0",
+  "entry": "main.ts",
+  "commands": [
+    {"id": "tidy", "title": "Tidy current block", "export": "tidy", "target": "block"},
+    {"id": "upper", "title": "Uppercase selection", "export": "upper", "target": "selection"}
+  ]
+}

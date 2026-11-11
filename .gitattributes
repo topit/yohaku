@@ -1,0 +1,4 @@
+# Private development records stay in the original repository, not source exports.
+/PLAN.md export-ignore
+/.agents export-ignore
+/.amp export-ignore

@@ -1,0 +1,428 @@
+--- a/ui/editor/state.go
++++ b/ui/editor/state.go
+@@ -33,6 +33,10 @@
+ 	// LineNumbers shows the numbers of lines in the gutter, absolute by
+ 	// default.
+ 	LineNumbers LineNumbers
++	// LineNumber maps a zero-based buffer line to its displayed number.
++	// Zero or negative hides its label. Nil uses the normal numbering.
++	// It changes only presentation, not offsets, navigation or copied text.
++	LineNumber func(line int) int
+ 	// ReadOnly makes the text selectable and copyable, not editable.
+ 	ReadOnly bool
+ 	// Whitespace says where spaces and tabs show as dots and arrows:
+@@ -123,6 +127,13 @@
+ 	// where they are as the text is edited: compute them again when the
+ 	// buffer's Version changes.
+ 	TextBackgrounds []TextBackground
++	// DividerLines shows lines exactly matching these strings as rules,
++	// without glyphs. They occupy one row, do not wrap, and pointer/keyboard
++	// navigation skips their text. Buffer offsets, selection, copy, find
++	// and undo still refer to the original text; a selected or found
++	// divider is highlighted across its row. This is presentation only:
++	// use a Buffer edit policy if these lines must not be edited.
++	DividerLines []string
+ 	// OnInput sees each input event before the editor, as keys for a
+ 	// mode of the app's such as Vim's: returning true takes it, and the
+ 	// editor leaves it. Text typed at the carets comes as InputText;
+@@ -232,6 +243,7 @@
+ 		autoClose: !st.NoAutoClose, folding: !st.NoFolding, activeLine: !st.NoActiveLine, cursorShape: st.CursorShape, fitContent: st.FitContent,
+ 		placeholder: st.Placeholder, label: st.Label, theme: st.Theme, bindings: st.Bindings, gutterMarks: st.GutterMarks,
+ 		backgrounds: st.LineBackgrounds, textBgs: st.TextBackgrounds, diffBase: st.DiffBase, onCompletion: st.OnCompletion, onHover: st.OnHover, onDefinition: st.OnDefinition,
++		dividerLines: st.DividerLines, lineNumber: st.LineNumber,
+ 		hoverDelay: st.HoverDelay, noPointerHover: st.NoPointerHover,
+ 		onGutterClick: st.OnGutterClick, contextMenu: st.ContextMenu, onInput: st.OnInput, noInputMethod: st.NoInputMethod, minDigits: 3,
+ 		renderFindBar: st.RenderFindBar, renderGoToLine: st.RenderGoToLine,
+--- a/ui/editor/editor.go
++++ b/ui/editor/editor.go
+@@ -31,6 +31,7 @@
+ 	wrap          bool
+ 	wrapColumn    int
+ 	lineNumbers   LineNumbers
++	lineNumber    func(int) int
+ 	whitespace    Whitespace
+ 	wrapGuides    []int
+ 	indentGuides  bool
+@@ -47,6 +48,7 @@
+ 	gutterMarks   []GutterMark
+ 	backgrounds   []LineBackground
+ 	textBgs       []TextBackground
++	dividerLines  []string
+ 	diffBase      *Buffer
+ 	onCompletion  func(CompletionRequest)
+ 	onHover       func(HoverRequest)
+@@ -269,6 +271,12 @@
+ 		ed.resetForBuffer()
+ 	}
+ 	ed.view.setBuffer(buf)
++	if !slices.Equal(ed.view.dividers, o.dividerLines) {
++		ed.view.dividers = slices.Clone(o.dividerLines)
++		ed.view.lines.m = nil
++		ed.view.heights.wraps.reset(ed.view.text.LineCount(), ed.view.wrap)
++		ed.view.wrapAt, ed.view.maxLine = 0, 0
++	}
+ 	if ed.sels == nil {
+ 		ed.sels = []sel{{goal: -1, id: 0}}
+ 		ed.nextID = 1
+@@ -498,6 +506,9 @@
+ 		return v.text.LineEnd(line)
+ 	}
+ 	l := v.line(line)
++	if l.divider {
++		return min(v.text.LineStart(line+1), v.text.Len())
++	}
+ 	ri := 0
+ 	switch {
+ 	case y < g.rows:
+@@ -532,7 +543,7 @@
+ 				ri++
+ 			} else {
+ 				next := line + 1
+-				for next < n && v.heights.isHidden(next) {
++				for next < n && (v.heights.isHidden(next) || v.isDivider(next)) {
+ 					next++
+ 				}
+ 				if next >= n {
+@@ -546,11 +557,11 @@
+ 				ri--
+ 			} else {
+ 				prev := line - 1
+-				for prev >= 0 && v.heights.isHidden(prev) {
++				for prev >= 0 && (v.heights.isHidden(prev) || v.isDivider(prev)) {
+ 					prev--
+ 				}
+ 				if prev < 0 {
+-					return 0, goal
++					return ed.overDividers(off, 0), goal
+ 				}
+ 				line, l = prev, v.line(prev)
+ 				ri = len(l.rows) - 1
+--- a/ui/editor/view.go
++++ b/ui/editor/view.go
+@@ -46,7 +46,8 @@
+ 	heights heights
+ 	// inlays are texts shown in lines that are not part of them, sorted
+ 	// by offset.
+-	inlays []inlay
++	inlays   []inlay
++	dividers []string
+ 
+ 	lines   lineCache
+ 	shaped  shapeCache
+@@ -78,17 +79,18 @@
+ 
+ // lineLayout is a line laid out for display.
+ type lineLayout struct {
+-	n     int
+-	start int    // the byte of the text it starts at
+-	text  string // the line, without its newline
+-	disp  string // as displayed: tabs expanded, inlays inserted
+-	segs  []dispSeg
+-	rows  []rowLayout
+-	toks  []Token
+-	exact bool      // toks from a confirmed state
+-	faces []faceRun // the faces of toks, none when all are regular
+-	width float32
+-	used  uint64
++	n       int
++	start   int    // the byte of the text it starts at
++	text    string // the line, without its newline
++	disp    string // as displayed: tabs expanded, inlays inserted
++	segs    []dispSeg
++	rows    []rowLayout
++	toks    []Token
++	exact   bool      // toks from a confirmed state
++	divider bool      // an opaque rule in place of the line's glyphs
++	faces   []faceRun // the faces of toks, none when all are regular
++	width   float32
++	used    uint64
+ }
+ 
+ // dispSeg maps a run of the displayed text to the line's: text, a tab
+@@ -496,7 +498,7 @@
+ 			// A guess: the highlighter may know better now. The layout
+ 			// depends on the tokens only through their faces.
+ 			l.toks, l.exact = v.tokens(n, l.text, l.toks[:0])
+-			if v.styled {
++			if v.styled && !l.divider {
+ 				v.faceScratch = v.facesOf(l, v.faceScratch[:0])
+ 				if !slices.Equal(v.faceScratch, l.faces) {
+ 					delete(v.lines.m, n)
+@@ -510,8 +512,11 @@
+ 	l.start = v.text.LineStart(n)
+ 	l.text = v.text.Slice(l.start, v.text.LineEnd(n))
+ 	l.toks, l.exact = v.tokens(n, l.text, nil)
+-	v.display(l)
+-	if v.styled {
++	l.divider = v.isDivider(n)
++	if !l.divider {
++		v.display(l)
++	}
++	if v.styled && !l.divider {
+ 		v.faceScratch = v.facesOf(l, v.faceScratch[:0])
+ 		if len(v.faceScratch) > 0 {
+ 			l.faces = slices.Clone(v.faceScratch)
+@@ -715,6 +720,9 @@
+ // toDisp maps a byte of the line to its displayed byte; after places an
+ // offset at an inlay after it.
+ func (l *lineLayout) toDisp(col int, after bool) int {
++	if l.divider {
++		return 0
++	}
+ 	if l.segs == nil {
+ 		return col
+ 	}
+@@ -759,6 +767,9 @@
+ // fromDisp maps a displayed byte to the byte of the line, the nearest
+ // edge for a byte inside a tab or an inlay.
+ func (l *lineLayout) fromDisp(d int) int {
++	if l.divider {
++		return len(l.text)
++	}
+ 	if l.segs == nil {
+ 		return min(d, len(l.text))
+ 	}
+--- a/ui/editor/commands.go
++++ b/ui/editor/commands.go
+@@ -397,7 +397,7 @@
+ 	sels := slices.Clone(ed.sels)
+ 	for i := range sels {
+ 		s := &sels[i]
+-		to := ed.overFolds(s.head, fn(*s))
++		to := ed.overDividers(s.head, ed.overFolds(s.head, fn(*s)))
+ 		if extend {
+ 			s.head = to
+ 		} else {
+--- a/ui/editor/paint.go
++++ b/ui/editor/paint.go
+@@ -367,6 +367,10 @@
+ 	ct := ed.theme
+ 	l := v.line(line)
+ 	lh := v.lineHeight
++	if l.divider {
++		ed.paintDivider(p, r, f, l, g)
++		return
++	}
+ 	ox := r.X + ed.textX - ed.scrollX
+ 	textRect := ui.Rect{X: r.X + ed.gutterW, W: r.W - ed.gutterW}
+ 	var style lineLook
+@@ -752,6 +756,12 @@
+ 				if ed.o.lineNumbers == LineNumbersRelative && line != cur {
+ 					n = max(line-cur, cur-line)
+ 				}
++				if ed.o.lineNumber != nil {
++					n = ed.o.lineNumber(line)
++					if n <= 0 {
++						n = -1
++					}
++				}
+ 				if n >= 0 {
+ 					s := strconv.Itoa(n)
+ 					lay := v.shaped.get(s, v.style)
+--- a/ui/editor/divider.go
++++ b/ui/editor/divider.go
+@@ -0,0 +1,74 @@
++package editor
++
++import (
++	"slices"
++
++	"github.com/egoist/mygo/ui"
++)
++
++func (v *view) isDivider(line int) bool {
++	return len(v.dividers) > 0 && slices.Contains(v.dividers, v.text.Line(line))
++}
++
++// overDividers keeps navigation out of opaque text without changing the
++// actual selections used by find, copy or history replay.
++func (ed *editor) overDividers(from, to int) int {
++	v := &ed.view
++	forward := to >= from
++	for v.isDivider(v.text.LineOf(to)) {
++		line := v.text.LineOf(to)
++		if forward || line == 0 {
++			next := min(v.text.LineStart(line+1), v.text.Len())
++			if next == to {
++				break
++			}
++			to, forward = next, true
++		} else {
++			to = v.text.LineStart(line) - 1
++		}
++	}
++	return to
++}
++
++func (ed *editor) paintDivider(p *ui.Painter, r ui.Rect, f *frame, l *lineLayout, g lineGeometry) {
++	row := ui.Rect{X: r.X + ed.gutterW, Y: r.Y + float32(g.rows-ed.scrollY), W: r.W - ed.gutterW, H: ed.view.lineHeight}
++	for _, b := range ed.o.backgrounds {
++		if l.n >= b.First && l.n <= b.Last {
++			lower := row
++			if l.n > 0 {
++				lower.Y += row.H / 2
++				lower.H /= 2
++			}
++			p.Fill(lower, b.Color, 0)
++		}
++		if l.n > 0 && l.n-1 >= b.First && l.n-1 <= b.Last {
++			upper := row
++			upper.H /= 2
++			p.Fill(upper, b.Color, 0)
++		}
++	}
++	end := l.start + len(l.text)
++	for _, m := range f.matches {
++		if m.end > l.start && m.start <= end {
++			color := ed.theme.Match
++			if m == f.current {
++				color = ed.theme.CurrentMatch
++			}
++			p.Fill(row, color, 0)
++		}
++	}
++	for _, s := range ed.sels {
++		if !s.empty() && s.end() > l.start && s.start() <= end {
++			color := ed.theme.Selection
++			if !ed.focused {
++				color = ed.theme.InactiveSelection
++			}
++			p.Fill(row, color, 0)
++		}
++	}
++	if l.n > 0 {
++		row.Y += row.H / 2
++		row.H = 1
++		p.Fill(row, ed.theme.LineNumber.Alpha(0.3), 0)
++	}
++}
+--- a/ui/editor/divider_test.go
++++ b/ui/editor/divider_test.go
+@@ -0,0 +1,115 @@
++package editor_test
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/egoist/mygo/ui"
++	"github.com/egoist/mygo/ui/editor"
++)
++
++func TestDividerPresentationPreservesTextAndNavigation(t *testing.T) {
++	header := strings.Repeat("metadata-中文😀", 30)
++	text := header + "\nalpha中😀\nSECOND\nbeta"
++	st := &editor.State{Buffer: editor.NewBuffer(text), DividerLines: []string{header, "SECOND"},
++		LineNumbers: editor.LineNumbersOff, NoActiveLine: true, NoFolding: true, SoftWrap: true,
++		Theme: &editor.Theme{Background: ui.RGB(255, 255, 255)}}
++	tt := ui.NewTester(func(c *ui.Context) { editor.View(c, st).Fill().AutoFocus() }, 180, 200)
++	tt.Frame()
++	if st.LineTop(1) != st.LineTop(2)-st.LineTop(1) {
++		t.Fatal("a long divider wrapped instead of occupying one row")
++	}
++	img := tt.Image()
++	scale := float32(img.Bounds().Dx()) / 180
++	// No text is painted anywhere in the first divider, not merely hidden
++	// under another element. Its first row deliberately has no rule above it.
++	for y := 1; y < int((float32(st.LineTop(1))-1)*scale); y++ {
++		for x := int(8 * scale); x < int(170*scale); x++ {
++			p := img.RGBAAt(x, y)
++			if p.R < 250 || p.G < 250 || p.B < 250 {
++				t.Fatalf("divider leaked glyphs at %d,%d: %+v", x, y, p)
++			}
++		}
++	}
++	first, second := len(header)+1, strings.Index(text, "beta")
++	st.Run(editor.MoveDocStart)
++	if st.Cursor() != first {
++		t.Fatal("document start landed inside the leading divider")
++	}
++	st.Select(second, second)
++	st.Run(editor.MoveLeft)
++	if st.Cursor() != strings.Index(text, "\nSECOND") {
++		t.Fatal("left did not cross the entire divider atomically")
++	}
++	st.Run(editor.SelectRight)
++	if st.Selection().Head != second || st.SelectedText() != "\nSECOND\n" {
++		t.Fatalf("shift-right lost cross-divider selection: %+v %q", st.Selection(), st.SelectedText())
++	}
++	st.Select(first+2, first+2)
++	st.Run(editor.MoveDown)
++	if st.Cursor() != second+2 {
++		t.Fatal("down did not skip divider while retaining its column")
++	}
++	st.Run(editor.MoveUp)
++	if st.Cursor() != first+2 {
++		t.Fatal("up did not skip divider while retaining its column")
++	}
++	tt.ClickAt(100, float32((st.LineTop(2)+st.LineTop(3))/2))
++	if st.Cursor() != second {
++		t.Fatal("clicking a divider did not enter the following body")
++	}
++	st.Run(editor.SelectAll)
++	st.Run(editor.Copy)
++	if tt.Clipboard() != text {
++		t.Fatal("presentation changed the copied text")
++	}
++	st.Find("SECOND")
++	tt.Frame()
++	if count, _ := st.FindMatches(); count != 1 || st.SelectedText() != "SECOND" {
++		t.Fatal("find lost the underlying divider text")
++	}
++	tt.Key(0, ui.KeyEscape)
++	st.Select(first+2, first+2)
++	st.Insert("new\n")
++	tt.Frame()
++	st.Run(editor.Undo)
++	tt.Frame()
++	if st.Buffer.String() != text {
++		t.Fatal("undo did not restore text after a divider shifted")
++	}
++	st.DividerLines = nil
++	tt.Frame()
++	tt.Frame()
++	if st.LineTop(1) <= st.LineTop(2)-st.LineTop(1) {
++		t.Fatal("removing divider presentation did not restore wrapped text")
++	}
++}
++
++func TestCustomLineNumberCanHideStructuralLabel(t *testing.T) {
++	st := &editor.State{Buffer: editor.NewBuffer("body\nbody"), NoFolding: true, NoActiveLine: true,
++		LineNumber: func(line int) int {
++			if line == 0 {
++				return 7
++			}
++			return 0
++		},
++		Theme: &editor.Theme{Background: ui.RGB(255, 255, 255), Text: ui.RGB(0, 0, 0), LineNumber: ui.RGB(255, 0, 0), ActiveLineNumber: ui.RGB(255, 0, 0)}}
++	tt := ui.NewTester(func(c *ui.Context) { editor.View(c, st).Fill() }, 180, 100)
++	tt.Frame()
++	img := tt.Image()
++	scale := float32(img.Bounds().Dx()) / 180
++	red := [2]int{}
++	for line := range 2 {
++		for y := int(float32(st.LineTop(line)) * scale); y < int(float32(st.LineTop(line+1))*scale); y++ {
++			for x := 0; x < int(70*scale); x++ {
++				p := img.RGBAAt(x, y)
++				if int(p.R) > int(p.G)+40 && int(p.R) > int(p.B)+40 {
++					red[line]++
++				}
++			}
++		}
++	}
++	if red[0] == 0 || red[1] != 0 {
++		t.Fatalf("custom/hidden line labels not painted correctly: %v", red)
++	}
++}
+--- a/ui/editor/theme.go
++++ b/ui/editor/theme.go
+@@ -13,0 +14,3 @@
++	// GutterBackground overrides the backdrop behind line numbers.
++	// Zero leaves the editor Background visible, as before.
++	GutterBackground ui.Color
+--- a/ui/editor/paint.go
++++ b/ui/editor/paint.go
+@@ -727,0 +728,3 @@
++		if ct.GutterBackground.A > 0 {
++			p.Fill(gutter, ct.GutterBackground, 0)
++		}

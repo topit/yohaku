@@ -1,0 +1,241 @@
+--- a/ui/editor/lsp.go
++++ b/ui/editor/lsp.go
+@@ -94,6 +94,9 @@
+ 	// Useful for trailing results that must not displace the insertion point.
+ 	// The default preserves normal hint placement after the inlay.
+ 	CursorBefore bool
++	// Padding adds display-only leading space in DIPs. With soft wrapping,
++	// omitted on lines whose padding and content cannot fit a single row.
++	Padding float32
+ }
+ 
+ // completions is the list of completions the editor shows.
+@@ -451,7 +454,7 @@
+ func (ed *editor) setInlays(hints []Inlay) {
+ 	ed.view.inlays = slices.DeleteFunc(ed.view.inlays, func(in inlay) bool { return in.kind == 0 })
+ 	for _, h := range hints {
+-		ed.view.inlays = append(ed.view.inlays, inlay{at: h.Offset, text: h.Text, cursorBefore: h.CursorBefore})
++		ed.view.inlays = append(ed.view.inlays, inlay{at: h.Offset, text: h.Text, cursorBefore: h.CursorBefore, padding: h.Padding})
+ 	}
+ 	sortInlays(ed.view.inlays)
+ 	ed.view.lines.m = nil
+--- a/ui/editor/view.go
++++ b/ui/editor/view.go
+@@ -76,6 +76,7 @@
+ 	text         string
+ 	kind         int // 0 a hint, 1 a suggestion
+ 	cursorBefore bool
++	padding      float32
+ }
+ 
+ // lineLayout is a line laid out for display.
+@@ -89,6 +90,7 @@
+ 	toks    []Token
+ 	exact   bool      // toks from a confirmed state
+ 	divider bool      // an opaque rule in place of the line's glyphs
++	padded  bool      // exact-width inlays fit this line without wrapping
+ 	faces   []faceRun // the faces of toks, none when all are regular
+ 	width   float32
+ 	used    uint64
+@@ -615,9 +617,55 @@
+ 	return out
+ }
+ 
+-// spansOf returns the spans of the faces of displayed bytes a to b of
+-// l, for text.Params, "" when they are all regular.
++// spansOf adds exact-width, non-text spacers to the ordinary face spans.
+ func (v *view) spansOf(l *lineLayout, a, b int) string {
++	faces := v.faceSpansOf(l, a, b)
++	if !l.padded {
++		return faces
++	}
++	var spans []text.Span
++	inlays := v.inlaysIn(l.start, l.start+len(l.text))
++	for _, seg := range l.segs {
++		if seg.kind != segInlay || seg.disp < a || seg.disp >= b || inlays[seg.inlay].padding <= 0 {
++			continue
++		}
++		if spans == nil {
++			spans = text.DecodeSpans(faces)
++			if len(spans) == 0 {
++				spans = []text.Span{{End: utf8.RuneCountInString(l.disp[a:b])}}
++			}
++		}
++		at := utf8.RuneCountInString(l.disp[a:seg.disp])
++		prev := 0
++		for i, sp := range spans {
++			if at < sp.End {
++				var replacement []text.Span
++				if at > prev {
++					prefix := sp
++					prefix.End = at
++					replacement = append(replacement, prefix)
++				}
++				object := sp
++				object.End, object.ObjectWidth = at+1, inlays[seg.inlay].padding
++				replacement = append(replacement, object)
++				if at+1 < sp.End {
++					replacement = append(replacement, sp)
++				}
++				spans = slices.Replace(spans, i, i+1, replacement...)
++				break
++			}
++			prev = sp.End
++		}
++	}
++	if spans == nil {
++		return faces
++	}
++	return text.EncodeSpans(spans)
++}
++
++// faceSpansOf returns the spans of the faces of displayed bytes a to b of
++// l, for text.Params, "" when they are all regular.
++func (v *view) faceSpansOf(l *lineLayout, a, b int) string {
+ 	if len(l.faces) == 0 {
+ 		return ""
+ 	}
+@@ -649,6 +697,7 @@
+ // stop, by columns counted in characters, and inlays inserted.
+ func (v *view) display(l *lineLayout) {
+ 	s := l.text
++	l.padded = false
+ 	inl := v.inlaysIn(l.start, l.start+len(s))
+ 	if strings.IndexByte(s, '\t') < 0 && len(inl) == 0 {
+ 		l.disp, l.segs = s, nil
+@@ -695,6 +744,30 @@
+ 	emitInlays(len(s))
+ 	flush(len(s))
+ 	l.disp = b.String()
++	var padding float32
++	for _, in := range inl {
++		padding += max(0, in.padding)
++	}
++	// Do not create artificial wraps. A line that cannot fit its padding
++	// keeps ordinary inline hints and the editor's normal wrap semantics.
++	if padding == 0 || v.wrap && v.runsWidth(l.disp, nil, 0, len(l.disp))+padding > v.wrapWidth {
++		return
++	}
++	l.padded = true
++	b.Reset()
++	from := 0
++	for i := range l.segs {
++		seg := &l.segs[i]
++		at := seg.disp
++		b.WriteString(l.disp[from:at])
++		seg.disp = b.Len()
++		if seg.kind == segInlay && inl[seg.inlay].padding > 0 {
++			b.WriteRune('\ufffc')
++		}
++		from = at
++	}
++	b.WriteString(l.disp[from:])
++	l.disp = b.String()
+ }
+ 
+ // maxTabColumn is where tabs stop expanding, which bounds the work
+@@ -801,7 +874,10 @@
+ // layoutRows wraps the displayed text of l into rows and shapes them.
+ func (v *view) layoutRows(l *lineLayout) {
+ 	l.rows = l.rows[:0]
+-	breaks := v.wrapBreaks(l.disp, l.faces)
++	var breaks []int
++	if !l.padded {
++		breaks = v.wrapBreaks(l.disp, l.faces)
++	}
+ 	indent := float32(0)
+ 	if len(breaks) > 0 {
+ 		indent = v.wrapIndent(l.disp)
+@@ -975,6 +1051,10 @@
+ 			l := &lineLayout{n: i, start: at, text: s}
+ 			v.display(l)
+ 			disp = l.disp
++			if l.padded {
++				w.set(i, 1)
++				return true
++			}
+ 		}
+ 		w.set(i, len(v.wrapBreaks(disp, nil))+1)
+ 		return true
+@@ -1182,6 +1262,15 @@
+ 			if bytesOf != nil && cluster < len(bytesOf) {
+ 				d = pc.from + bytesOf[cluster]
+ 			}
++			if l.padded {
++				i := sort.Search(len(l.segs), func(i int) bool { return l.segs[i].disp >= d })
++				if i < len(l.segs) && l.segs[i].disp == d && l.segs[i].kind == segInlay {
++					in := v.inlaysIn(l.start, l.start+len(l.text))[l.segs[i].inlay]
++					if in.padding > 0 {
++						return ui.Color{} // An inline object has geometry, not a glyph.
++					}
++				}
++			}
+ 			c := cc.at(d, def)
+ 			if override != nil {
+ 				c = override(d, c)
+--- /dev/null
++++ b/ui/editor/inlay_padding_test.go
+@@ -0,0 +1,63 @@
++package editor_test
++
++import (
++	"math"
++	"testing"
++
++	"github.com/egoist/mygo/ui"
++	"github.com/egoist/mygo/ui/editor"
++)
++
++func TestInlayPaddingPreservesCaretCopyAndHitTargets(t *testing.T) {
++	for _, source := range []string{"12 + 3", "中文 12 + 3", "\t12 + 3"} {
++		st := &editor.State{Buffer: editor.NewBuffer(source), Label: "Padding editor", SoftWrap: true}
++		tt := ui.NewTester(func(c *ui.Context) { editor.View(c, st).Fill().AutoFocus() }, 700, 240)
++		st.Select(len(source), len(source))
++		tt.Frame()
++		before, _ := tt.TextCaret()
++		st.SetInlays([]editor.Inlay{{Offset: len(source), Text: "= 15", Padding: 100, CursorBefore: true}})
++		tt.Frame()
++		after, _ := tt.TextCaret()
++		if before != after {
++			t.Fatal("padding moved source caret", source, before, after)
++		}
++		area, found := tt.Find("Padding editor")
++		if !found {
++			t.Fatal("editor missing")
++		}
++		_, hit := st.HitTest(before.X+110-area.X, before.Y+before.H/2-area.Y)
++		if hit != len(source) {
++			t.Fatal("padded result not hit", source, hit)
++		}
++		st.SetInlays([]editor.Inlay{{Offset: len(source), Text: "= 15"}})
++		tt.Frame()
++		plain, _ := tt.TextCaret()
++		st.SetInlays([]editor.Inlay{{Offset: len(source), Text: "= 15", Padding: 100}})
++		tt.Frame()
++		padded, _ := tt.TextCaret()
++		if math.Abs(float64(padded.X-plain.X-100)) > .1 {
++			t.Fatal("padding is not an exact display width", source, plain, padded)
++		}
++		st.Select(0, len(source))
++		tt.Key(ui.Cmd, ui.KeyC)
++		if tt.Clipboard() != source {
++			t.Fatal("display spacer leaked into clipboard")
++		}
++		st.Select(len(source), len(source))
++		tt.Type("7")
++		st.Run(editor.Undo)
++		if st.Buffer.String() != source {
++			t.Fatal("display spacer changed undo history")
++		}
++		tt.SetSize(180, 240)
++		st.SetInlays([]editor.Inlay{{Offset: len(source), Text: "= 15"}})
++		tt.Frame()
++		plain, _ = tt.TextCaret()
++		st.SetInlays([]editor.Inlay{{Offset: len(source), Text: "= 15", Padding: 100000}})
++		tt.Frame()
++		padded, _ = tt.TextCaret()
++		if plain != padded {
++			t.Fatal("padding must not force an extra wrapped row", source, plain, padded)
++		}
++	}
++}

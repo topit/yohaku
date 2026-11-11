@@ -1,0 +1,117 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  test-and-build:
+    name: Check ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify Linux runtime and install pinned test font
+        if: runner.os == 'Linux'
+        run: |
+          # ubuntu-24.04 already includes these. Fail if the runner image changes
+          # rather than depending on an unrelated apt mirror for every build.
+          for package in libgtk-3-0t64 libfontconfig1 fonts-dejavu-core; do
+            test "$(dpkg-query -W -f='${Status}' "$package")" = 'install ok installed'
+          done
+          fonts="$HOME/.local/share/fonts/yohaku-ci"
+          mkdir -p "$fonts"
+          upstream=https://raw.githubusercontent.com/notofonts/noto-cjk/523d033d6cb47f4a80c58a35753646f5c3608a78
+          curl --fail --location --retry 3 --max-time 120 \
+            "$upstream/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf" \
+            -o "$fonts/NotoSansCJKsc-Regular.otf"
+          echo "2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b  $fonts/NotoSansCJKsc-Regular.otf" | sha256sum --check
+          curl --fail --location --retry 3 --max-time 120 "$upstream/LICENSE" -o "$fonts/OFL.txt"
+          fc-cache -f "$fonts"
+          fc-match -f '%{family}' 'Noto Sans CJK SC' | grep -F 'Noto Sans CJK SC'
+      - name: Bootstrap the pinned MyGo dependency
+        run: sh scripts/bootstrap.sh
+      - name: Validate release tag
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: test "$RELEASE_TAG" = "v$(cat VERSION)"
+      - name: Test with the race detector
+        # Native windows and JS VMs share the hosted runner's CPU and memory.
+        # Serialize packages; keep the race detector and all test cases enabled.
+        run: go test -race -p 1 -count=1 ./...
+      - name: Vet the production build
+        run: go vet -tags mygo_noinspector ./...
+      - name: Build and package macOS
+        if: runner.os == 'macOS'
+        run: |
+          sh scripts/build-macos.sh
+          # Ad-hoc signing is not Developer ID signing or notarization.
+          codesign --force --deep --sign - build/Yohaku.app
+          codesign --verify --deep --strict build/Yohaku.app
+          arch=$(go env GOARCH)
+          archive="Yohaku-v$(cat VERSION)-macos-$arch.zip"
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent build/Yohaku.app "dist/$archive"
+          unzip -t "dist/$archive"
+          (cd dist && shasum -a 256 "$archive" > "$archive.sha256")
+          echo "YOHAKU_ARCH=$arch" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: runner.os == 'macOS'
+        with:
+          name: yohaku-macos-${{ env.YOHAKU_ARCH }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish preview release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test-and-build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: yohaku-macos-*
+          merge-multiple: true
+          path: dist
+      - name: Verify archives and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cd dist
+          sha256sum --check ./*.sha256
+          test -f "Yohaku-$RELEASE_TAG-macos-arm64.zip"
+          test -f "Yohaku-$RELEASE_TAG-macos-amd64.zip"
+          sha256sum ./*.zip > SHA256SUMS
+          cd ..
+          gh release create "$RELEASE_TAG" dist/*.zip dist/SHA256SUMS \
+            --verify-tag --draft --prerelease --title "Yohaku $RELEASE_TAG" \
+            --notes-file docs/RELEASE_NOTES.md
+          gh release edit "$RELEASE_TAG" --draft=false

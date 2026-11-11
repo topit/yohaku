@@ -1,0 +1,150 @@
+--- a/ui/editor/lsp.go
++++ b/ui/editor/lsp.go
+@@ -90,6 +90,10 @@
+ type Inlay struct {
+ 	Offset int
+ 	Text   string
++	// CursorBefore keeps a caret at Offset before this display-only text.
++	// Useful for trailing results that must not displace the insertion point.
++	// The default preserves normal hint placement after the inlay.
++	CursorBefore bool
+ }
+ 
+ // completions is the list of completions the editor shows.
+@@ -447,7 +451,7 @@
+ func (ed *editor) setInlays(hints []Inlay) {
+ 	ed.view.inlays = slices.DeleteFunc(ed.view.inlays, func(in inlay) bool { return in.kind == 0 })
+ 	for _, h := range hints {
+-		ed.view.inlays = append(ed.view.inlays, inlay{at: h.Offset, text: h.Text})
++		ed.view.inlays = append(ed.view.inlays, inlay{at: h.Offset, text: h.Text, cursorBefore: h.CursorBefore})
+ 	}
+ 	sortInlays(ed.view.inlays)
+ 	ed.view.lines.m = nil
+--- a/ui/editor/view.go
++++ b/ui/editor/view.go
+@@ -72,9 +72,10 @@
+ // inlay is text shown in a line at an offset, as an inlay hint or a
+ // suggestion.
+ type inlay struct {
+-	at   int
+-	text string
+-	kind int // 0 a hint, 1 a suggestion
++	at           int
++	text         string
++	kind         int // 0 a hint, 1 a suggestion
++	cursorBefore bool
+ }
+ 
+ // lineLayout is a line laid out for display.
+@@ -96,11 +97,11 @@
+ // dispSeg maps a run of the displayed text to the line's: text, a tab
+ // expanded to spaces, or an inlay.
+ type dispSeg struct {
+-	disp     int // the displayed byte it starts at
+-	from, to int // the bytes of the line it shows
+-	kind     uint8
+-	inlay    int
+-	ghost    bool // a suggestion, which a caret at it shows before
++	disp        int // the displayed byte it starts at
++	from, to    int // the bytes of the line it shows
++	kind        uint8
++	inlay       int
++	caretBefore bool // a suggestion or trailing result, before which the caret stays
+ }
+ 
+ const (
+@@ -669,7 +670,7 @@
+ 		for ii < len(inl) && inl[ii].at-l.start <= at {
+ 			flush(at)
+ 			in := inl[ii]
+-			l.segs = append(l.segs, dispSeg{disp: b.Len(), from: at, to: at, kind: segInlay, inlay: ii, ghost: in.kind == 1})
++			l.segs = append(l.segs, dispSeg{disp: b.Len(), from: at, to: at, kind: segInlay, inlay: ii, caretBefore: in.kind == 1 || in.cursorBefore})
+ 			b.WriteString(in.text)
+ 			col += utf8.RuneCountInString(in.text)
+ 			ii++
+@@ -726,6 +727,13 @@
+ 	if l.segs == nil {
+ 		return col
+ 	}
++	if after {
++		for _, s := range l.segs {
++			if s.kind == segInlay && s.from == col && s.caretBefore {
++				return s.disp
++			}
++		}
++	}
+ 	out := len(l.disp)
+ 	for i := len(l.segs) - 1; i >= 0; i-- {
+ 		s := l.segs[i]
+@@ -743,7 +751,7 @@
+ 			}
+ 		case segInlay:
+ 			if col == s.from {
+-				if after && !s.ghost {
++				if after && !s.caretBefore {
+ 					return s.disp + segLen(l, i)
+ 				}
+ 				out = s.disp
+--- /dev/null
++++ b/ui/editor/inlay_cursor_test.go
+@@ -0,0 +1,60 @@
++package editor_test
++
++import (
++	"testing"
++
++	"github.com/egoist/mygo/ui"
++	"github.com/egoist/mygo/ui/editor"
++)
++
++func TestTrailingInlayDoesNotMoveInsertionPoint(t *testing.T) {
++	for _, source := range []string{"4/", "结果 = 42", "\t12/3", "ab/cd"} {
++		t.Run(source, func(t *testing.T) {
++			st := &editor.State{Buffer: editor.NewBuffer(source), SoftWrap: true}
++			tt := ui.NewTester(func(c *ui.Context) { editor.View(c, st).Fill().AutoFocus() }, 220, 160)
++			at := len(source)
++			if source == "ab/cd" {
++				at = 3 // Also exercise a hint between two text segments.
++			}
++			st.Select(at, at)
++			tt.Frame()
++			before, ok := tt.TextCaret()
++			if !ok {
++				t.Fatal("missing focused insertion point")
++			}
++			st.SetInlays([]editor.Inlay{{Offset: at, Text: "   ! a long result that wraps over multiple rows", CursorBefore: true}})
++			tt.Frame()
++			after, ok := tt.TextCaret()
++			if !ok || after != before {
++				t.Fatalf("inlay displaced insertion point: before=%+v after=%+v", before, after)
++			}
++			tt.Type("7")
++			if st.Buffer.String() != source[:at]+"7"+source[at:] || st.Cursor() != at+1 {
++				t.Fatal("typing followed display text instead of source")
++			}
++			st.Run(editor.Undo)
++			if st.Buffer.String() != source || st.Cursor() != at {
++				t.Fatal("inlay changed source history")
++			}
++			st.Select(0, len(source))
++			tt.Key(ui.Cmd, ui.KeyC)
++			if tt.Clipboard() != source {
++				t.Fatal("copied display-only text")
++			}
++		})
++	}
++}
++
++func TestDefaultInlayKeepsExistingCaretPlacement(t *testing.T) {
++	st := &editor.State{Buffer: editor.NewBuffer("4/")}
++	tt := ui.NewTester(func(c *ui.Context) { editor.View(c, st).Fill().AutoFocus() }, 600, 160)
++	st.Select(2, 2)
++	tt.Frame()
++	before, _ := tt.TextCaret()
++	st.SetInlays([]editor.Inlay{{Offset: 2, Text: "   = 2"}})
++	tt.Frame()
++	after, _ := tt.TextCaret()
++	if after.X <= before.X || after.Y != before.Y {
++		t.Fatal("default hint behavior changed")
++	}
++}

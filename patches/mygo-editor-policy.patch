@@ -1,0 +1,289 @@
+--- a/ui/editor/buffer.go
++++ b/ui/editor/buffer.go
+@@ -49,6 +49,7 @@
+ 	lastEdit time.Time
+ 	crlf     bool // the text's line endings are \r\n
+ 	syntax   *syntaxState
++	policy   func(Snapshot, []Edit) bool
+ 	// restarts are the lines that start in state 0 in the default
+ 	// highlighter, the first lines of a patch's hunks (setRestarts),
+ 	// which each version moves (record); restartsText is the text they
+@@ -286,6 +287,27 @@
+ 	b.edit(edits, editOther, nil, nil)
+ }
+ 
++// SetEditPolicy sets a policy for each batch of edits, including editor,
++// input-method and programmatic edits. The edits are normalized, nonoverlapping
++// UTF-8 ranges in before. Returning false rejects the entire batch before
++// text, version or undo history change. A nil policy accepts all edits.
++// The callback runs under the buffer lock: it must not call Buffer methods,
++// retain or modify edits, or block. Undo/redo replay previously accepted
++// transactions; Reset is a trusted document reload, not a policy-checked edit.
++func (b *Buffer) SetEditPolicy(policy func(before Snapshot, edits []Edit) bool) {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	b.policy = policy
++}
++
++// TryEdit is Edit with an acceptance result, including accepted no-op edits.
++func (b *Buffer) TryEdit(edits ...Edit) bool {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	_, accepted := b.edit(edits, editOther, nil, nil)
++	return accepted
++}
++
+ // Transact groups the edits fn makes, through Edit and the editors
+ // showing the buffer, into one step of undo.
+ func (b *Buffer) Transact(fn func()) {
+@@ -376,10 +398,10 @@
+ }
+ 
+ // edit applies edits as a transaction, or into the open one; b.mu is
+-// held. It returns the changes, nil when nothing changed.
+-func (b *Buffer) edit(edits []Edit, kind editKind, owner, selBefore any) []change {
++// held. It returns the changes and whether the batch was accepted.
++func (b *Buffer) edit(edits []Edit, kind editKind, owner, selBefore any) ([]change, bool) {
+ 	if len(edits) == 0 {
+-		return nil
++		return nil, true
+ 	}
+ 	if !slices.IsSortedFunc(edits, func(x, y Edit) int { return x.Start - y.Start }) {
+ 		edits = slices.Clone(edits)
+@@ -397,6 +419,7 @@
+ 	before := b.text
+ 	text := before
+ 	changes := make([]change, 0, len(edits))
++	var normalized []Edit
+ 	delta, lineDelta, last := 0, 0, 0
+ 	for _, e := range edits {
+ 		start := max(last, min(e.Start, before.Len()))
+@@ -419,9 +442,15 @@
+ 		delta += len(e.Text) - (end - start)
+ 		lineDelta += (c.newEndLine - c.newLine) - (c.oldEndLine - c.oldLine)
+ 		changes = append(changes, c)
++		if b.policy != nil {
++			normalized = append(normalized, Edit{Start: start, End: end, Text: e.Text})
++		}
+ 	}
+ 	if len(changes) == 0 {
+-		return nil
++		return nil, true
++	}
++	if b.policy != nil && !b.policy(Snapshot{before, b.version, b.crlf}, normalized) {
++		return nil, false
+ 	}
+ 	b.text = text
+ 	b.record(changes)
+@@ -449,7 +478,7 @@
+ 		}
+ 	}
+ 	b.lastEdit = now
+-	return changes
++	return changes, true
+ }
+ 
+ // endGroup ends the group of typing, so that the next edit makes a step
+--- a/ui/editor/edit.go
++++ b/ui/editor/edit.go
+@@ -27,12 +27,15 @@
+ 		ed.stale = true
+ 		return false
+ 	}
++	changes, accepted := b.edit(edits, kind, ed, before)
++	made := b.version
++	b.mu.Unlock()
++	if !accepted {
++		return false
++	}
+ 	if ed.snippet != nil && !ed.snippet.accepts(edits) {
+ 		ed.snippet = nil
+ 	}
+-	changes := b.edit(edits, kind, ed, before)
+-	made := b.version
+-	b.mu.Unlock()
+ 	if changes == nil {
+ 		// The edits change nothing, as pasting the text selected over
+ 		// it: the selections still go where the edits put them, as the
+--- a/ui/editor/input.go
++++ b/ui/editor/input.go
+@@ -677,8 +677,10 @@
+ 		return
+ 	}
+ 	ts := ed.targets(r)
++	if !ed.replaceRanges(ts, s, editCompose, -1, -1) {
++		return
++	}
+ 	ed.markedActive, ed.marked = false, nil
+-	ed.replaceRanges(ts, s, editCompose, -1, -1)
+ 	if b := ed.buf(); b != nil {
+ 		b.endGroup()
+ 	}
+@@ -697,7 +699,9 @@
+ 	ts := ed.targets(r)
+ 	// Selected counts UTF-16 units of s.
+ 	sa, sz := utf16ByteOffset(s, selected.Start), utf16ByteOffset(s, selected.End)
+-	ed.replaceRanges(ts, s, editCompose, sa, sz)
++	if !ed.replaceRanges(ts, s, editCompose, sa, sz) {
++		return
++	}
+ 	ed.markedActive = s != ""
+ 	ed.marked = ed.marked[:0]
+ 	switch {
+@@ -719,7 +723,7 @@
+ 
+ // replaceRanges replaces each range with s, selecting sa to sz of it, or
+ // putting the caret after it.
+-func (ed *editor) replaceRanges(ts []ui.TextInputRange, s string, kind editKind, sa, sz int) {
++func (ed *editor) replaceRanges(ts []ui.TextInputRange, s string, kind editKind, sa, sz int) bool {
+ 	edits := make([]Edit, len(ts))
+ 	for i, t := range ts {
+ 		edits[i] = Edit{Start: t.Start, End: t.End, Text: s}
+@@ -727,7 +731,7 @@
+ 	single := len(ts) == 1 && len(ed.sels) > 1
+ 	sels := slices.Clone(ed.sels)
+ 	newest := ed.primary().id
+-	ok := ed.apply(edits, kind, func(move func(int, bias) int) []sel {
++	return ed.apply(edits, kind, func(move func(int, bias) int) []sel {
+ 		if single {
+ 			// One range the input method named: the newest caret goes in
+ 			// it, where the input method says, the others move with the
+@@ -763,9 +767,6 @@
+ 		}
+ 		return out
+ 	})
+-	if !ok && s == "" {
+-		return
+-	}
+ }
+ 
+ func (ed *editor) UnmarkText() {
+--- a/ui/editor/find.go
++++ b/ui/editor/find.go
+@@ -312,10 +312,12 @@
+ 	for i, m := range f.matches {
+ 		if m.start == p.start() && m.end == p.end() {
+ 			with := f.replacement(text, i)
+-			ed.apply([]Edit{{Start: m.start, End: m.end, Text: with}}, editOther, func(move func(int, bias) int) []sel {
++			if !ed.apply([]Edit{{Start: m.start, End: m.end, Text: with}}, editOther, func(move func(int, bias) int) []sel {
+ 				at := move(m.start, biasLeft) + len(with)
+ 				return []sel{ed.newSel(at, at)}
+-			})
++			}) {
++				return
++			}
+ 			f.search(ed)
+ 			f.current = i
+ 			f.step(ed, 1)
+--- a/ui/editor/policy_test.go
++++ b/ui/editor/policy_test.go
+@@ -0,0 +1,109 @@
++package editor
++
++import (
++	"reflect"
++	"slices"
++	"strings"
++	"testing"
++
++	"github.com/egoist/mygo/ui"
++)
++
++// A snapshot includes the state a rejection must not mutate. In particular,
++// nil changes must not be mistaken for an accepted no-op by editor.apply.
++type policyCheckpoint struct {
++	text            string
++	version         uint64
++	log, undo, redo int
++	sels            []Selection
++	marked          []ui.TextInputRange
++	active          bool
++}
++
++func checkpoint(st *State) policyCheckpoint {
++	b := st.Buffer
++	return policyCheckpoint{b.String(), b.Version(), len(b.log), len(b.undo), len(b.redo),
++		st.Selections(), slices.Clone(st.ed.marked), st.ed.markedActive}
++}
++
++func protectMark(b *Buffer) {
++	b.SetEditPolicy(func(s Snapshot, edits []Edit) bool {
++		start := strings.Index(s.String(), "MARK")
++		for _, e := range edits {
++			if e.Start < start+4 && e.End > start || e.Start == e.End && e.Start >= start && e.Start < start+4 {
++				return false
++			}
++		}
++		return true
++	})
++}
++
++func unchanged(t *testing.T, st *State, before policyCheckpoint) {
++	t.Helper()
++	if got := checkpoint(st); !reflect.DeepEqual(got, before) {
++		t.Fatalf("rejected edit mutated state:\n got %+v\nwant %+v", got, before)
++	}
++}
++
++func TestPolicyRejectsWholeBatchAndPreservesRedo(t *testing.T) {
++	ct := newEditorTest(t, "", "MARK\nbody|")
++	protectMark(ct.st.Buffer)
++	ct.st.Insert("!")
++	ct.st.Run(Undo)
++	ct.st.SetSelections(Selection{Anchor: 1, Head: 2}, Selection{Anchor: 6, Head: 7})
++	before := checkpoint(ct.st)
++	ct.st.Insert("中文😀")
++	unchanged(t, ct.st, before)
++	if ct.st.Buffer.TryEdit(Edit{Start: 1, End: 2}, Edit{Start: 6, End: 7}) {
++		t.Fatal("partial batch was accepted")
++	}
++	unchanged(t, ct.st, before)
++	ct.st.Buffer.Set("destroy all")
++	unchanged(t, ct.st, before)
++	ct.st.Run(Redo)
++	if ct.st.Buffer.String() != "MARK\nbody!" {
++		t.Fatal("rejected edit lost redo")
++	}
++}
++
++func TestPolicyIMERejectionPreservesMarkedText(t *testing.T) {
++	ct := newEditorTest(t, "", "MARK\n|body")
++	protectMark(ct.st.Buffer)
++	ct.st.Select(0, 4)
++	before := checkpoint(ct.st)
++	ct.st.ed.SetMarkedText(nil, "中", ui.TextInputRange{Start: 1, End: 1})
++	unchanged(t, ct.st, before)
++	ct.st.Select(5, 5)
++	ct.st.ed.SetMarkedText(nil, "中😀", ui.TextInputRange{Start: 3, End: 3})
++	if !ct.st.ed.markedActive || ct.st.Buffer.String() != "MARK\n中😀body" {
++		t.Fatal("valid composition failed")
++	}
++	before = checkpoint(ct.st)
++	r := &ui.TextInputRange{Start: 0, End: 4}
++	ct.st.ed.SetMarkedText(r, "bad", ui.TextInputRange{Start: 3, End: 3})
++	unchanged(t, ct.st, before)
++	ct.st.ed.ReplaceText(r, "bad commit")
++	unchanged(t, ct.st, before)
++	ct.st.ed.ReplaceText(nil, "中文😀")
++	if ct.st.ed.markedActive || ct.st.Buffer.String() != "MARK\n中文😀body" {
++		t.Fatal("valid commit failed")
++	}
++	ct.st.Run(Undo)
++	if ct.st.Buffer.String() != "MARK\nbody" {
++		t.Fatal("composition and commit did not undo as one step")
++	}
++}
++
++func TestPolicyFindReplaceRejectsWithoutAdvancing(t *testing.T) {
++	ct := newEditorTest(t, "", "|MARK\nbody MARK")
++	protectMark(ct.st.Buffer)
++	ct.st.Find("MARK")
++	ct.st.Select(0, 4)
++	f := &ct.st.ed.find
++	f.replace = "gone"
++	before := checkpoint(ct.st)
++	f.replaceOne(&ct.st.ed)
++	unchanged(t, ct.st, before)
++	f.replaceAll(&ct.st.ed)
++	unchanged(t, ct.st, before)
++}

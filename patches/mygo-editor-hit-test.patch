@@ -1,0 +1,43 @@
+diff --git a/.deps/mygo/ui/editor/hittest.go b/ui/editor/hittest.go
+new file mode 100644
+index 0000000..996cd1a
+--- /dev/null
++++ b/ui/editor/hittest.go
+@@ -0,0 +1,37 @@
++package editor
++
++// HitTest returns the document line under an editor-local point, and the
++// offset of a display-only inlay there (-1 when none). It uses the same
++// wrapped rows and shaped glyph positions as painting, including scrolling.
++// It does not move selections or change input-method composition.
++func (st *State) HitTest(x, y float32) (line, inlayOffset int) {
++	st.ensure()
++	ed := &st.ed
++	cx, cy := ed.toContent(x, y)
++	v := &ed.view
++	line = v.heights.lineAt(cy)
++	inlayOffset = -1
++	if ed.regionAt(x, y) != regionText {
++		return
++	}
++	g := v.heights.geometry(line)
++	if g.hidden || cy < g.rows || cy >= g.below {
++		return
++	}
++	l := v.line(line)
++	if l.divider {
++		return
++	}
++	ri := min(int((cy-g.rows)/float64(v.lineHeight)), len(l.rows)-1)
++	row := &l.rows[ri]
++	for i, seg := range l.segs {
++		if seg.kind != segInlay {
++			continue
++		}
++		a, b := max(row.from, seg.disp), min(row.to, seg.disp+segLen(l, i))
++		if a < b && cx >= v.xOf(l, row, a) && cx < v.xOf(l, row, b) {
++			return line, l.start + seg.from
++		}
++	}
++	return
++}
