@@ -1,23 +1,23 @@
-# Yohaku 0.1.1 preview
+# Yohaku 0.1.2 preview
 
 Yohaku is a lightweight, local-first scratchpad built with Go and MyGo Native UI.
-This update refines the main window's paper-page presentation:
+This patch restores alternating block backgrounds in the paper-page interface:
 
-- Block actions and Math copying move into the footer, removing the empty
-  toolbar row from ordinary notes. Image & text notes keep their top toolbar.
-- Text and Markdown use the paper background; code and Math use a subtle tint.
-  The empty canvas after the final block always returns to paper.
-- Syntax colors follow each theme in both light and dark modes.
-- More compact tabs retain their track. Ordinary notes no longer show a file
-  icon; close buttons appear on the active or hovered tab.
+- Adjacent blocks alternate between paper and a subtle tint by position,
+  including consecutive text, Markdown, code and Math blocks.
+- Deleting a block recomputes the stripes for the remaining positions;
+  undo and redo restore the corresponding backgrounds.
+- The empty canvas after the final block always stays paper, regardless of
+  the final block's tint. Block dividers and line-number settings are preserved.
 
-The line-number setting still applies to every ordinary block. Editing, storage,
-block commands and image & text entry points are unchanged.
+The rest of the 0.1.1 paper-page interface is unchanged: compact tabs, themed
+syntax colors and footer block actions. Editing, storage and image & text
+entry points are unchanged.
 
 ## Download and install
 
-- **Apple Silicon:** `Yohaku-v0.1.1-macos-arm64.zip`.
-- **Intel:** `Yohaku-v0.1.1-macos-amd64.zip`.
+- **Apple Silicon:** `Yohaku-v0.1.2-macos-arm64.zip`.
+- **Intel:** `Yohaku-v0.1.2-macos-amd64.zip`.
 - `SHA256SUMS` contains the archive checksums.
 
 Quit an older Yohaku with **⌘Q**, unzip the archive, then move `Yohaku.app` to

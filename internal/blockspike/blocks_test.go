@@ -297,8 +297,25 @@ func TestBlockLineNumbersRestartAndFollowEdits(t *testing.T) {
 	check([]int{0, 1, 0, 1})
 	st = NewState("⟦yohaku:Plain Text⟧\nfirst\n⟦yohaku:Markdown⟧\n# second\n⟦yohaku:Math⟧\n12 * 8")
 	check([]int{0, 1, 0, 1, 0, 1})
-	if st.LineBackgrounds[0].Color != colors[0] || st.LineBackgrounds[1].Color != colors[0] || st.LineBackgrounds[2].Color != colors[1] {
-		t.Fatal("prose and Math backgrounds do not follow language")
+	if st.LineBackgrounds[0].Color != colors[0] || st.LineBackgrounds[1].Color != colors[1] || st.LineBackgrounds[2].Color != colors[0] {
+		t.Fatal("mixed block backgrounds do not alternate")
+	}
+	for _, language := range []string{"Plain Text", "Markdown", "Math", "Go"} {
+		t.Run(language, func(t *testing.T) {
+			st := NewState(strings.Repeat("⟦yohaku:"+language+"⟧\nbody\n", 4))
+			st.LineNumbers = editor.LineNumbersOff
+			if got := Decorate(st, colors); got != colors[0] {
+				t.Fatal("trailing canvas is not paper")
+			}
+			for i, block := range st.LineBackgrounds {
+				if block.Color != colors[i%2] {
+					t.Fatalf("block %d does not alternate", i+1)
+				}
+			}
+			if st.LineNumbers != editor.LineNumbersOff {
+				t.Fatal("presentation enabled line numbers")
+			}
+		})
 	}
 }
 

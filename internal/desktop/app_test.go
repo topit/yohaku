@@ -836,24 +836,27 @@ func TestPaperFooterFitsNarrowWindow(t *testing.T) {
 	}
 }
 
-func TestBlockPresentationUsesLanguageWithoutChangingDocument(t *testing.T) {
+func TestBlockPresentationAlternatesWithoutChangingDocument(t *testing.T) {
 	for _, mode := range []string{"light", "dark"} {
 		t.Run(mode, func(t *testing.T) {
 			b := notebook.NewBook()
 			n := b.Current()
 			n.State.Insert("first 中文😀 " + strings.Repeat("a wrapping thought ", 8))
 			n.AddBlock()
-			n.SetLanguage("Python")
-			n.State.Insert("def shared():\n    return 42")
+			n.SetLanguage("Plain Text")
+			n.State.Insert("second text block")
 			n.AddBlock()
 			n.SetLanguage("JSON")
 			n.State.Insert(`{"shared": true}`)
 			n.AddBlock()
 			n.SetLanguage("Markdown")
-			n.State.Insert("# Paper again")
+			n.State.Insert("# Markdown block")
 			n.AddBlock()
 			n.SetLanguage("Math")
 			n.State.Insert("12 * 8")
+			n.AddBlock()
+			n.SetLanguage("Math")
+			n.State.Insert("14.9 / 238")
 			before := n.State.Buffer.String()
 			store := notebook.Store{Dir: t.TempDir()}
 			if err := os.WriteFile(filepath.Join(store.Dir, "preferences.json"), []byte(`{"mode":"`+mode+`"}`), 0600); err != nil {
@@ -878,8 +881,13 @@ func TestBlockPresentationUsesLanguageWithoutChangingDocument(t *testing.T) {
 				return pixel(float32(n.State.LineTop(snapshot.LineOf(blocks[index].Body))) + 3)
 			}
 			first, second, third := bodyColor(0), bodyColor(1), bodyColor(2)
-			if first == second || second != third || bodyColor(3) != first || bodyColor(4) != second {
-				t.Fatalf("block backgrounds do not follow language: %v %v %v", first, second, third)
+			if first == second {
+				t.Fatal("adjacent text blocks have the same background")
+			}
+			for i := range blocks {
+				if got, want := bodyColor(i), [][3]uint8{first, second}[i%2]; got != want {
+					t.Fatalf("block %d background = %v, want %v", i+1, got, want)
+				}
 			}
 			if pixel(area.H-20) != first {
 				t.Fatal("canvas after the final Math block is not paper")
@@ -925,7 +933,7 @@ func TestBlockPresentationUsesLanguageWithoutChangingDocument(t *testing.T) {
 				current, _ := notebook.Blocks(n.State.Buffer.String())
 				last := current[len(current)-1]
 				lastColor := pixel(float32(n.State.LineTop(n.State.Buffer.Snapshot().LineOf(last.Body))) + 3)
-				if lastColor != second || pixel(area.H-20) != first {
+				if lastColor != [][3]uint8{first, second}[(len(current)-1)%2] || pixel(area.H-20) != first {
 					t.Fatal("new code block or trailing paper has the wrong color")
 				}
 			}
@@ -937,6 +945,52 @@ func TestBlockPresentationUsesLanguageWithoutChangingDocument(t *testing.T) {
 			if n.State.Buffer.String() != before || gutterColor(area.H-20) != gutter || pixel(area.H-20) != first {
 				t.Fatal("undo did not restore document and trailing canvas without recoloring gutter")
 			}
+			checkAfterRemoval := func(t *testing.T, wantCount int) {
+				t.Helper()
+				tt.Frame()
+				img = tt.Image()
+				snapshot = n.State.Buffer.Snapshot()
+				blocks, _ = notebook.Blocks(n.State.Buffer.String())
+				if len(blocks) != wantCount {
+					t.Fatalf("block count = %d, want %d", len(blocks), wantCount)
+				}
+				for i, block := range blocks {
+					if got, want := bodyColor(i), [][3]uint8{first, second}[i%2]; got != want {
+						t.Fatalf("block %d after removal = %v, want %v", i+1, got, want)
+					}
+					if n.State.LineNumber(snapshot.LineOf(block.Body)) != 1 {
+						t.Fatalf("block %d line numbers did not restart", i+1)
+					}
+				}
+				if pixel(area.H-20) != first || gutterColor(area.H-20) != gutter {
+					t.Fatal("removal recolored trailing paper or gutter")
+				}
+			}
+			// Delete each original position, including both sides of same-type
+			// pairs, then exercise both undo and redo on the rendered palette.
+			for index := range 6 {
+				t.Run("remove-"+strconv.Itoa(index+1), func(t *testing.T) {
+					n.State.Select(blocks[index].Body, blocks[index].Body)
+					n.RemoveBlock()
+					checkAfterRemoval(t, 5)
+					n.State.Run(editor.Undo)
+					checkAfterRemoval(t, 6)
+					if n.State.Buffer.String() != before {
+						t.Fatal("undo removal did not restore document")
+					}
+					n.State.Run(editor.Redo)
+					checkAfterRemoval(t, 5)
+					n.State.Run(editor.Undo)
+					checkAfterRemoval(t, 6)
+				})
+			}
+			for count := 6; count > 1; count-- {
+				n.State.Select(blocks[0].Body, blocks[0].Body)
+				n.RemoveBlock()
+				checkAfterRemoval(t, count-1)
+			}
+			n.RemoveBlock() // The final block becomes an empty paper block.
+			checkAfterRemoval(t, 1)
 		})
 	}
 }
