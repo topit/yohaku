@@ -797,7 +797,46 @@ func TestEditorSurfaceFitsWindowAfterResize(t *testing.T) {
 	}
 }
 
-func TestBlockPresentationAlternatesWithoutChangingDocument(t *testing.T) {
+func TestPaperFooterFitsNarrowWindow(t *testing.T) {
+	for _, locale := range []string{"en", "zh-Hans"} {
+		t.Run(locale, func(t *testing.T) {
+			store := notebook.Store{Dir: t.TempDir()}
+			if err := os.WriteFile(filepath.Join(store.Dir, "preferences.json"), []byte(`{"language":"`+locale+`"}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			book := notebook.NewBook()
+			a := desktop.New(book, store)
+			defer a.Close()
+			tt := ui.NewTester(a.View, 760, 480)
+			for _, language := range []string{"Plain Text", "Markdown", "Math", "JavaScript"} {
+				book.Current().SetLanguage(language)
+				tt.Frame()
+				previousEnd := float32(0)
+				labels := []string{"Block language", "+ Block", a.T("Block actions")}
+				if language == "Math" {
+					labels = []string{"Block language", "Copy result", "+ Block", a.T("Block actions")}
+				}
+				for _, label := range labels {
+					r, ok := tt.Find(label)
+					if !ok || r.W < 18 || r.X < previousEnd || r.X+r.W > 752 || r.Y < 440 || r.Y+r.H > 472 {
+						t.Fatalf("%s footer control %q clipped or overlapping: %+v", language, label, r)
+					}
+					previousEnd = r.X + r.W
+				}
+				click(t, tt, a.T("Block actions"))
+				for _, item := range []string{"Insert block before", "Split block at cursor", "Delete current block…"} {
+					r, ok := tt.Find(a.T(item))
+					if !ok || r.X < 0 || r.Y < 0 || r.X+r.W > 760 || r.Y+r.H > 440 {
+						t.Fatalf("footer menu item %q outside visible area: %+v", item, r)
+					}
+				}
+				tt.Key(0, ui.KeyEscape)
+			}
+		})
+	}
+}
+
+func TestBlockPresentationUsesLanguageWithoutChangingDocument(t *testing.T) {
 	for _, mode := range []string{"light", "dark"} {
 		t.Run(mode, func(t *testing.T) {
 			b := notebook.NewBook()
@@ -809,6 +848,12 @@ func TestBlockPresentationAlternatesWithoutChangingDocument(t *testing.T) {
 			n.AddBlock()
 			n.SetLanguage("JSON")
 			n.State.Insert(`{"shared": true}`)
+			n.AddBlock()
+			n.SetLanguage("Markdown")
+			n.State.Insert("# Paper again")
+			n.AddBlock()
+			n.SetLanguage("Math")
+			n.State.Insert("12 * 8")
 			before := n.State.Buffer.String()
 			store := notebook.Store{Dir: t.TempDir()}
 			if err := os.WriteFile(filepath.Join(store.Dir, "preferences.json"), []byte(`{"mode":"`+mode+`"}`), 0600); err != nil {
@@ -833,8 +878,11 @@ func TestBlockPresentationAlternatesWithoutChangingDocument(t *testing.T) {
 				return pixel(float32(n.State.LineTop(snapshot.LineOf(blocks[index].Body))) + 3)
 			}
 			first, second, third := bodyColor(0), bodyColor(1), bodyColor(2)
-			if first != third || first == second {
-				t.Fatalf("block backgrounds do not alternate: %v %v %v", first, second, third)
+			if first == second || second != third || bodyColor(3) != first || bodyColor(4) != second {
+				t.Fatalf("block backgrounds do not follow language: %v %v %v", first, second, third)
+			}
+			if pixel(area.H-20) != first {
+				t.Fatal("canvas after the final Math block is not paper")
 			}
 			for i := 1; i < len(blocks); i++ {
 				bodyLine := snapshot.LineOf(blocks[i].Body)
@@ -855,8 +903,7 @@ func TestBlockPresentationAlternatesWithoutChangingDocument(t *testing.T) {
 			if n.State.Buffer.String() != before {
 				t.Fatal("presentation changed document text")
 			}
-			// Appending flips the last block's color, not the gutter or existing
-			// bodies. Only the newly created block and its remaining canvas change.
+			// Appending never recolors existing bodies, gutter or trailing paper.
 			gutterColor := func(y float32) [3]uint8 {
 				p := img.RGBAAt(int((area.X+2)*scale), int((area.Y+y)*scale))
 				return [3]uint8{p.R, p.G, p.B}
@@ -864,6 +911,7 @@ func TestBlockPresentationAlternatesWithoutChangingDocument(t *testing.T) {
 			gutter := gutterColor(area.H - 20)
 			for range 3 {
 				n.AddBlock()
+				n.SetLanguage("Go")
 				tt.Frame()
 				img = tt.Image()
 				for _, y := range []float32{3, 60, area.H - 20} {
@@ -877,16 +925,16 @@ func TestBlockPresentationAlternatesWithoutChangingDocument(t *testing.T) {
 				current, _ := notebook.Blocks(n.State.Buffer.String())
 				last := current[len(current)-1]
 				lastColor := pixel(float32(n.State.LineTop(n.State.Buffer.Snapshot().LineOf(last.Body))) + 3)
-				if pixel(area.H-20) != lastColor {
-					t.Fatal("new last block did not fill the remaining text canvas")
+				if lastColor != second || pixel(area.H-20) != first {
+					t.Fatal("new code block or trailing paper has the wrong color")
 				}
 			}
-			for range 3 {
+			for range 6 {
 				n.State.Run(editor.Undo)
 			}
 			tt.Frame()
 			img = tt.Image()
-			if n.State.Buffer.String() != before || gutterColor(area.H-20) != gutter || pixel(area.H-20) != third {
+			if n.State.Buffer.String() != before || gutterColor(area.H-20) != gutter || pixel(area.H-20) != first {
 				t.Fatal("undo did not restore document and trailing canvas without recoloring gutter")
 			}
 		})

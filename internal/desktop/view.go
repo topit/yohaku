@@ -16,7 +16,6 @@ var (
 
 	plusIcon     = symbol(`M8 2v12M2 8h12`)
 	closeIcon    = symbol(`M4 4l8 8M12 4l-8 8`)
-	noteIcon     = symbol(`M4 2h5l3 3v9H4zM9 2v4h3M6 9h4M6 11h3`)
 	settingsIcon = symbol(`M6.5 1.5h3l.5 2 1.5.8 2-.5 1.5 2.6-1.5 1.5v1.8l1.5 1.5-1.5 2.6-2-.5-1.5.8-.5 2h-3l-.5-2-1.5-.8-2 .5-1.5-2.6 1.5-1.5V7.4L1 5.9l1.5-2.6 2 .5L6 3zM10.5 8a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0`)
 	moreIcon     = symbol(`M3 8h.01M8 8h.01M13 8h.01`)
 	chevronIcon  = symbol(`M4 6l4 4 4-4`)
@@ -75,8 +74,10 @@ func (a *App) View(c *ui.Context) {
 			ui.Column(c.Key("canvas")).Label("Editor surface").Grow(1).MinHeight(0).Margin(0, 8, 8, 8).
 				Radius(10).Clip().Background(p.Paper).Border(1, p.UI.Border).
 				Shadow(0, 1, 3, 0, p.Shadow).Children(func() {
-				a.paneHeader(c)
 				n := a.Book.Current()
+				if n.Rich != nil {
+					ui.Row(c).Height(36).Padding(0, 14).Gap(8).AlignItems(ui.Center).Children(func() { a.richTools(c) })
+				}
 				ui.Box(c.Key("body")).Grow(1).FillWidth().MinHeight(0).Padding(12, 22, 8, 22).Children(func() {
 					if n.Rich != nil {
 						a.richView(c)
@@ -101,7 +102,7 @@ func (a *App) View(c *ui.Context) {
 					}
 					st.Theme = &editor.Theme{Background: background, GutterBackground: p.Paper, Text: p.UI.Text, Cursor: p.UI.Accent,
 						Selection: p.UI.Selection, LineNumber: p.UI.TextMuted, ActiveLineNumber: p.UI.Text}
-					st.Theme.Tokens[editor.TokenStrong].Bold = true
+					p.syntax(st.Theme)
 					st.RenderFindBar = func(c *ui.Context, bar ui.Element, f *editor.FindBar) {
 						editor.DefaultFindBar(c, bar, f)
 						a.rememberInput(c, bar, &a.findRef)
@@ -211,7 +212,10 @@ func (a *App) tabs(c *ui.Context, vertical bool) {
 	total := float32(4 + 2*(len(widths)-1))
 	for i, n := range a.Book.Open {
 		w, _ := c.MeasureText(0, ui.Span{Text: n.Title, Size: 13, Weight: 500})
-		widths[i] = min(max(w+70, 112), 214)
+		widths[i] = min(max(w+44, 88), 214)
+		if n.Rich != nil {
+			widths[i] = min(widths[i]+20, 214)
+		}
 		if vertical {
 			widths[i] = 204
 			total += 28
@@ -304,11 +308,9 @@ func (a *App) tabs(c *ui.Context, vertical bool) {
 					if !whole {
 						return
 					}
-					icon := noteIcon
 					if n.Rich != nil {
-						icon = imageIcon
+						ui.Icon(c, imageIcon).Size(13, 13).TextColor(col).Shrink(0)
 					}
-					ui.Icon(c, icon).Size(13, 13).TextColor(col).Shrink(0)
 					if a.renameID == n.ID {
 						in := ui.TextInputBase(c, &a.renameText).Grow(1).MinWidth(0).Height(18).FontSize(13).TextColor(ink).Label("Note name")
 						a.rememberInput(c, in, &a.renameRef)
@@ -330,9 +332,13 @@ func (a *App) tabs(c *ui.Context, vertical bool) {
 						}
 						ui.Text(c, n.Title).FontSize(13).FontWeight(weight).TextColor(col).SingleLine().Ellipsis("…").Grow(1).MinWidth(0)
 					}
-					if action(c, closeIcon, "Close "+n.Title, a.commandTip("Archive tab", "note.close"), 18).Clicked() {
-						closeIndex = i
-						a.focus, a.renameID = true, ""
+					if active || tab.Hovered() {
+						if action(c, closeIcon, "Close "+n.Title, a.commandTip("Archive tab", "note.close"), 18).Clicked() {
+							closeIndex = i
+							a.focus, a.renameID = true, ""
+						}
+					} else {
+						ui.Box(c).Size(18, 18).Shrink(0)
 					}
 				})
 			}
@@ -404,71 +410,55 @@ func (a *App) tabMenu(n *notebook.Note, m *ui.Menu) {
 	}
 }
 
-func (a *App) paneHeader(c *ui.Context) {
+func (a *App) blockTools(c *ui.Context) {
 	p := a.colors
 	muted, hover := p.UI.TextMuted, p.UI.SurfaceHover
 	n := a.Book.Current()
 	b, _, _ := n.CurrentBlock()
-	ui.Row(c).Height(36).Padding(0, 14).Gap(8).AlignItems(ui.Center).Children(func() {
-		if n.Rich != nil {
-			a.richTools(c)
-			return
+	if b.Language == "Math" {
+		r := a.currentMath()
+		tip := a.commandTip("Copy Math result", "math.copy")
+		if r.Copy != "" {
+			tip += "\n" + r.Copy
+		} else if r.Error != "" {
+			tip = r.Error
 		}
-		ui.Box(c).Grow(1)
-		if b.Language == "Math" {
-			r := a.currentMath()
-			tip := a.commandTip("Copy Math result", "math.copy")
-			if r.Copy != "" {
-				tip += "\n" + r.Copy
-			} else if r.Error != "" {
-				tip = r.Error
-			}
-			if action(c, copyIcon, "Copy result", tip, 26).Disabled(r.Copy == "").Clicked() {
-				a.copyMath(c)
-				a.focus = true
-			}
-		}
-		add := ui.ButtonBase(c).Height(26).Padding(0, 8).Radius(6).Label("+ Block").Tooltip(a.commandTip("Add block", "block.add"))
-		if add.Hovered() {
-			add.Background(hover)
-		}
-		add.Children(func() {
-			ui.Row(c).Gap(5).AlignItems(ui.Center).Children(func() {
-				ui.Icon(c, plusIcon).Size(12, 12).TextColor(muted)
-				ui.Text(c, a.T("Add block")).FontSize(11).TextColor(muted)
-			})
-		})
-		if add.Clicked() {
-			n.AddBlock()
+		if action(c, copyIcon, "Copy result", tip, 26).Disabled(r.Copy == "").Clicked() {
+			a.copyMath(c)
 			a.focus = true
 		}
-		more := ui.ButtonBase(c).Height(26).Padding(0, 8).Radius(6).Label(a.T("Block actions"))
-		if more.Hovered() {
-			more.Background(hover)
+	}
+	add := ui.ButtonBase(c).Height(26).Padding(0, 8).Radius(6).Label("+ Block").Tooltip(a.commandTip("Add block", "block.add"))
+	if add.Hovered() {
+		add.Background(hover)
+	}
+	add.Children(func() {
+		ui.Row(c).Gap(5).AlignItems(ui.Center).Children(func() {
+			ui.Icon(c, plusIcon).Size(12, 12).TextColor(muted)
+			ui.Text(c, a.T("Add block")).FontSize(11).TextColor(muted)
+		})
+	})
+	if add.Clicked() {
+		n.AddBlock()
+		a.focus = true
+	}
+	more := action(c, moreIcon, a.T("Block actions"), a.T("More"), 26)
+	more.PopoverMenuButton(func(m *ui.Menu) {
+		mods, key, _ := parseBinding(a.commandBinding("block.before"))
+		if m.Item(a.T("Insert block before")).Shortcut(mods, key).Chosen() {
+			n.AddBlockBefore()
+			a.focus = true
 		}
-		more.Children(func() {
-			ui.Row(c).Gap(5).AlignItems(ui.Center).Children(func() {
-				ui.Text(c, a.T("More")).FontSize(11).TextColor(muted)
-				ui.Icon(c, moreIcon).Size(12, 12).TextColor(muted)
-			})
-		})
-		more.PopoverMenuButton(func(m *ui.Menu) {
-			mods, key, _ := parseBinding(a.commandBinding("block.before"))
-			if m.Item(a.T("Insert block before")).Shortcut(mods, key).Chosen() {
-				n.AddBlockBefore()
-				a.focus = true
-			}
-			mods, key, _ = parseBinding(a.commandBinding("block.split"))
-			if m.Item(a.T("Split block at cursor")).Shortcut(mods, key).Chosen() {
-				n.SplitBlock()
-				a.focus = true
-			}
-			m.Separator()
-			if m.Item(a.T("Delete current block…")).Danger().Chosen() {
-				a.OpenCommands()
-				a.commands.page = "delete"
-			}
-		})
+		mods, key, _ = parseBinding(a.commandBinding("block.split"))
+		if m.Item(a.T("Split block at cursor")).Shortcut(mods, key).Chosen() {
+			n.SplitBlock()
+			a.focus = true
+		}
+		m.Separator()
+		if m.Item(a.T("Delete current block…")).Danger().Chosen() {
+			a.OpenCommands()
+			a.commands.page = "delete"
+		}
 	})
 }
 
@@ -483,18 +473,18 @@ func (a *App) statusBar(c *ui.Context) {
 	if a.SaveError != "" {
 		status, dot = "Save failed", ui.Hex("#c86259")
 	}
-	ui.Row(c).Height(26).Padding(0, 14).Gap(6).AlignItems(ui.Center).Children(func() {
+	ui.Row(c).Height(28).Padding(0, 14).Gap(6).AlignItems(ui.Center).Children(func() {
 		ui.Box(c).Size(4, 4).Radius(2).Background(dot)
-		ui.Text(c, a.T(status)).FontSize(10).TextColor(muted)
+		ui.Text(c, a.T(status)).FontSize(11).TextColor(muted).SingleLine().Shrink(0)
 		if n.Rich == nil && b.Language == "Math" {
-			ui.Text(c, a.mathStatus()).FontSize(10).TextColor(muted).SingleLine().MaxWidth(360).Shrink(1).MinWidth(0).ClipX().Tooltip(a.math.err)
+			ui.Text(c, a.mathStatus()).FontSize(11).TextColor(muted).SingleLine().MaxWidth(360).Shrink(1).MinWidth(0).ClipX().Tooltip(a.math.err)
 		}
 		ui.Box(c).Grow(1)
 		if n.Rich != nil {
-			ui.Text(c, a.T("Image & text")).FontSize(10).TextColor(muted)
+			ui.Text(c, a.T("Image & text")).FontSize(11).TextColor(muted)
 			return
 		}
-		ui.Textf(c, a.T("Block %d / %d"), index+1, total).FontSize(10).TextColor(muted)
+		ui.Textf(c, a.T("Block %d / %d"), index+1, total).FontSize(11).TextColor(muted).SingleLine().Shrink(0)
 		ui.Box(c).Size(1, 11).Background(a.colors.UI.Border).Margin(0, 3)
 		language := ui.ButtonBase(c).Height(24).Padding(0, 6).Radius(6).Label("Block language").Tooltip(a.commandTip("Change this block's language", "block.language"))
 		if language.Hovered() {
@@ -514,5 +504,7 @@ func (a *App) statusBar(c *ui.Context) {
 				}
 			}
 		})
+		ui.Box(c).Size(1, 11).Background(a.colors.UI.Border).Margin(0, 3)
+		a.blockTools(c)
 	})
 }

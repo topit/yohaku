@@ -544,7 +544,8 @@ func TestSettingsEditorLanguageAndRecovery(t *testing.T) {
 	click(t, tt, "Language zh-Hans")
 	click(t, tt, "Save settings")
 	tt.Frame()
-	if a.T("Settings") != "设置" || !tt.HasText("添加块") || !tt.HasText("更多") || n.Title != "Settings" {
+	_, hasActions := tt.Find(a.T("Block actions"))
+	if a.T("Settings") != "设置" || !tt.HasText("添加块") || !hasActions || n.Title != "Settings" {
 		t.Fatal("language not applied to interface, or user title translated", tt.Texts())
 	}
 	if n.State.Font.Size != 14 || n.State.LineNumbers != editor.LineNumbersOff || !n.State.NoScrollPastEnd || n.State.Buffer.Version() != version {

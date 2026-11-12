@@ -295,6 +295,11 @@ func TestBlockLineNumbersRestartAndFollowEdits(t *testing.T) {
 	}
 	st = NewState("⟦yohaku:Plain Text⟧\nother\n⟦yohaku:Go⟧\nlast")
 	check([]int{0, 1, 0, 1})
+	st = NewState("⟦yohaku:Plain Text⟧\nfirst\n⟦yohaku:Markdown⟧\n# second\n⟦yohaku:Math⟧\n12 * 8")
+	check([]int{0, 1, 0, 1, 0, 1})
+	if st.LineBackgrounds[0].Color != colors[0] || st.LineBackgrounds[1].Color != colors[0] || st.LineBackgrounds[2].Color != colors[1] {
+		t.Fatal("prose and Math backgrounds do not follow language")
+	}
 }
 
 func BenchmarkBlockPresentation(b *testing.B) {

@@ -1,18 +1,23 @@
-# First public preview
+# Yohaku 0.1.1 preview
 
 Yohaku is a lightweight, local-first scratchpad built with Go and MyGo Native UI.
-This first public preview includes:
+This update refines the main window's paper-page presentation:
 
-- Continuous, multi-language block notes, Math results and image & text notes.
-- Tabs or a sidebar, command center, themes, fonts and configurable shortcuts.
-- Trusted local TypeScript command plugins, without Node.js or a plugin market.
-- Heynote import, autosave, per-note files, archives and recovery exports.
-- macOS close-to-hide, Dock restore and save-before-quit protection.
+- Block actions and Math copying move into the footer, removing the empty
+  toolbar row from ordinary notes. Image & text notes keep their top toolbar.
+- Text and Markdown use the paper background; code and Math use a subtle tint.
+  The empty canvas after the final block always returns to paper.
+- Syntax colors follow each theme in both light and dark modes.
+- More compact tabs retain their track. Ordinary notes no longer show a file
+  icon; close buttons appear on the active or hovered tab.
+
+The line-number setting still applies to every ordinary block. Editing, storage,
+block commands and image & text entry points are unchanged.
 
 ## Download and install
 
-- **Apple Silicon:** `Yohaku-v0.1.0-macos-arm64.zip`.
-- **Intel:** `Yohaku-v0.1.0-macos-amd64.zip`.
+- **Apple Silicon:** `Yohaku-v0.1.1-macos-arm64.zip`.
+- **Intel:** `Yohaku-v0.1.1-macos-amd64.zip`.
 - `SHA256SUMS` contains the archive checksums.
 
 Quit an older Yohaku with **⌘Q**, unzip the archive, then move `Yohaku.app` to

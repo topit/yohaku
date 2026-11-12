@@ -116,8 +116,8 @@ func (p *Presentation) Decorate(st *editor.State, colors [2]ui.Color) ui.Color {
 	return p.background
 }
 
-// Decorate presents structural lines as rules and alternates block colors.
-// The returned backdrop extends the last block to the editor's bottom.
+// Decorate presents structural lines as rules, with paper for prose and an
+// alternate background for code and Math. The trailing canvas stays paper.
 // No text, selections or history are changed by presentation.
 func Decorate(st *editor.State, blockColors ...[2]ui.Color) ui.Color {
 	st.LineBackgrounds = st.LineBackgrounds[:0]
@@ -133,13 +133,16 @@ func Decorate(st *editor.State, blockColors ...[2]ui.Color) ui.Color {
 	background := colors[0]
 	for i := range s.LineCount() {
 		line := s.Line(i)
-		if _, ok := Marker(line); ok {
+		if language, ok := Marker(line); ok {
 			number = 0
 			count := len(st.LineBackgrounds)
 			if count > 0 {
 				st.LineBackgrounds[count-1].Last = i - 1
 			}
-			background = colors[count%2]
+			background = colors[0]
+			if language != "Plain Text" && language != "Markdown" {
+				background = colors[1]
+			}
 			st.LineBackgrounds = append(st.LineBackgrounds, editor.LineBackground{
 				First: i, Last: s.LineCount() - 1, Color: background,
 			})
@@ -157,5 +160,5 @@ func Decorate(st *editor.State, blockColors ...[2]ui.Color) ui.Color {
 		}
 		return 0
 	}
-	return background
+	return colors[0]
 }

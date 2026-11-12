@@ -10,6 +10,7 @@ import (
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
+	"github.com/egoist/mygo/ui/editor"
 	"yohaku/internal/notebook"
 )
 
@@ -35,6 +36,7 @@ type palette struct {
 	Paper, Alternate, Header    ui.Color
 	Tab, Track, Shadow, Overlay ui.Color
 	Notice, NoticeText, Error   ui.Color
+	SyntaxName, SyntaxValue     ui.Color
 }
 
 var themeNames = []struct{ id, name, detail string }{
@@ -87,9 +89,13 @@ var palettes = func() map[string][2]*palette {
 			p := &palette{UI: t, Paper: ui.Hex(paper), Alternate: ui.Hex(alternate), Header: ui.Hex(header),
 				Tab: ui.Hex(paper), Track: t.Surface.Alpha(0.6), Shadow: ui.RGBA(20, 15, 25, 0.10),
 				Overlay: ui.RGBA(18, 14, 24, 0.18), Notice: ui.Hex("#fbf5e8"), NoticeText: ui.Hex("#85642e"), Error: ui.Hex("#fff0ed")}
+			p.SyntaxName = ui.Hex([]string{"#866648", "#76664f", "#74658b", "#7b6847"}[i])
+			p.SyntaxValue = ui.Hex([]string{"#50698c", "#536b83", "#4d7187", "#4f7369"}[i])
 			if d == 1 {
 				p.Shadow, p.Overlay = ui.RGBA(0, 0, 0, 0.3), ui.RGBA(0, 0, 0, 0.45)
 				p.Notice, p.NoticeText, p.Error = ui.Hex("#373023"), ui.Hex("#e7ca91"), ui.Hex("#3c2529")
+				p.SyntaxName = ui.Hex([]string{"#d3b58f", "#cbb99d", "#c4b2d8", "#d0bd91"}[i])
+				p.SyntaxValue = ui.Hex([]string{"#a7bddb", "#acc1d5", "#a2c8d5", "#a4c9ba"}[i])
 			}
 			for j, color := range wash {
 				p.Wash[j] = ui.Hex(color).Mix(p.Paper, 0.6)
@@ -100,6 +106,30 @@ var palettes = func() map[string][2]*palette {
 	}
 	return out
 }()
+
+func (p *palette) syntax(t *editor.Theme) {
+	// Set every token explicitly: zero colors fall back to MyGo's GitHub theme.
+	for kind := range t.Tokens {
+		t.Tokens[kind].Color = p.UI.Text
+	}
+	for _, kind := range []editor.TokenKind{editor.TokenKeyword, editor.TokenHeading, editor.TokenTag, editor.TokenLink} {
+		t.Tokens[kind].Color = p.UI.Accent
+	}
+	for _, kind := range []editor.TokenKind{editor.TokenComment, editor.TokenOperator, editor.TokenPunctuation} {
+		t.Tokens[kind].Color = p.UI.TextMuted
+	}
+	for _, kind := range []editor.TokenKind{editor.TokenType, editor.TokenFunction, editor.TokenMeta} {
+		t.Tokens[kind].Color = p.SyntaxName
+	}
+	for _, kind := range []editor.TokenKind{editor.TokenNumber, editor.TokenConstant, editor.TokenProperty, editor.TokenString,
+		editor.TokenEscape, editor.TokenRegexp, editor.TokenAttribute, editor.TokenCode} {
+		t.Tokens[kind].Color = p.SyntaxValue
+	}
+	t.Tokens[editor.TokenInserted].Color = p.UI.Success
+	t.Tokens[editor.TokenDeleted].Color = p.UI.Danger
+	t.Tokens[editor.TokenInvalid].Color = p.UI.Danger
+	t.Tokens[editor.TokenStrong].Bold = true
+}
 
 func (p preferences) valid() bool {
 	_, ok := palettes[p.Theme]
